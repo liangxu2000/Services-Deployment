@@ -140,6 +140,14 @@
      系统盘/已挂载盘永不选取；数据盘按 BDF/序列号稳定排序后取第 N 块。
    - 这是**功能 bring-up 口径**，不代表最终容量/带宽；性能测试前再扩多块盘。
 
+**3.2 当前 NoF 镜像（2026-11-18，同事构建）**
+
+- 镜像：`mooncake-runtime-nof-vsegment:202611180847.cb1d25e7`（commit `cb1d25e7`）；
+  tar 6,626,733,568 B；构建日志显示在 **node1**；已分发到 10 个节点并打 `latest`。
+- NoF 服务部署时使用 `MOONCAKE_IMAGE=mooncake-runtime-nof-vsegment:latest`。
+- 待与同事对齐：同事进度写的是「k8s-2 部署 rank/recall（NoF 参数改造）」，
+  我们的计划是新增 `k8s-4`；部署前必须确认命名/命名空间，避免两套同时改。
+
 ---
 
 ## 4. 任务索引
@@ -148,7 +156,7 @@
 |---|---|---|---|
 | NOF-001 | 环境摸底（只读） | **DONE** | 2026-11-17 |
 | NOF-002 | 基线故障 + 镜像/ SR-IOV 只读深挖 | **DONE** | 2026-11-17 |
-| NOF-003 | 镜像文件级只读查验 + 探针/虚拟化能力核对 | **已下发** | 2026-11-17 |
+| NOF-003 | 新 NoF 镜像只读查验 + 探针/虚拟化能力核对 | **已下发（2026-11-18 更新镜像）** | 2026-11-18 |
 
 ---
 
@@ -233,28 +241,47 @@
 
 ## 6. 当前任务
 
-### NOF-003 镜像文件级只读查验 + 探针/虚拟化能力核对
+### NOF-003 新 NoF 镜像只读查验 + 探针/虚拟化能力核对
 
-**上一轮结论**：CrashLoop 是 etcd 启动窗口瞬态（已自愈）；镜像元数据无 NoF/SPDK 痕迹；
+**上一轮结论**：CrashLoop 是 etcd 启动窗口瞬态（已自愈）；旧镜像无 NoF/SPDK 痕迹；
 SR-IOV 32 VF 但 `vwci=0`、无 device plugin、hugepages=0；环境新增 recall + memory-pressure。
 
-**本轮目标**：不运行/不导出镜像、不 `exec`，用 containerd content store 只读确认镜像里到底有没有
-`nof_register` / SPDK / URMA；核对 live DS 探针；补齐 NVMe 虚拟化字段；记录新基线。
+**新事实（2026-11-18，同事构建）**：已产出 NoF-vsegment 运行时镜像
+`mooncake-runtime-nof-vsegment:202611180847.cb1d25e7`（commit `cb1d25e7`，
+tar 6,626,733,568 B），并已分发到 10 个节点、打上 `latest`。本轮改为查验**这个新镜像**。
+
+**本轮目标**：不运行/不导出镜像、不 `exec`，用 containerd content store 只读确认新镜像里到底有没有
+`nof_register` / `nof_unregister` / SPDK（含 `nvmf_tgt`）/ URMA / target 启动脚本；
+核对 10 节点镜像一致性、live DS 探针；补齐 NVMe 虚拟化字段；记录新基线。
 
 **授权边界**：只读。允许 `ctr -n k8s.io content ls/get`（`get` 只输出到 stdout 并管道给 `tar`/`jq`，
 **不落盘**）、`kubectl get/describe/logs`、`ssh` 只读命令、`nvme id-ctrl`。
 禁止：`kubectl exec`、`ctr image export/import/rm`、创建/删除资源、写 `sriov_numvfs`、
 改 hugepages、绑 vfio、`modprobe/rmmod`、重启任何东西。
 
+#### A0. 新镜像存在性/一致性（10 节点，只读）
+
+```bash
+ctr -n k8s.io images ls | grep -E 'mooncake-runtime-nof-vsegment' || true
+crictl images | grep -E 'mooncake-runtime-nof-vsegment' || true
+```
+
+记录每个节点的 `repo:tag@digest`；确认 `latest` 指向 `202611180847.cb1d25e7`，
+且 10 节点 digest 一致。缺哪个节点、哪个 tag 不一致，列出来。
+
 #### A. 镜像文件级查验（不落盘）
 
-目标：确认镜像内是否存在：
+目标：确认**新镜像**内是否存在：
 
 - `/home/Mooncake/outputs/bin/nof_register`
 - `/home/Mooncake/outputs/bin/nof_unregister`
 - `/home/Mooncake/outputs/bin/mooncake_client`
+- `/home/Mooncake/outputs/bin/mooncake_master`
 - `/usr/local/include/spdk/nvme_urma.h`
 - `/usr/local/lib/libspdk_nvme.a`（或 `libspdk_*`）
+- SPDK target：`nvmf_tgt`（常见 `/usr/local/bin/nvmf_tgt` 或 `/home/spdk/build/bin/nvmf_tgt`）
+- SPDK RPC：`spdk_rpc.py` / `scripts/rpc.py`
+- target / NoF 启动脚本（`/home/mooncake/scripts/`、`/home/Mooncake/`、`spdk_tgt_create.py` 等）
 
 方法（按顺序尝试；任何一步不支持就记录并换下一种）：
 
@@ -262,15 +289,15 @@ SR-IOV 32 VF 但 `vwci=0`、无 device plugin、hugepages=0；环境新增 recal
 # 1) 列出 content store（找 manifest / config / layers）
 ctr -n k8s.io content ls
 
-# 2) 从 crictl inspecti 拿到 image 的 config digest / layer digest
-crictl inspecti docker.io/library/mooncake-runtime-w00921547:latest
+# 2) 从 crictl inspecti 拿到新 image 的 config digest / layer digest
+crictl inspecti docker.io/library/mooncake-runtime-nof-vsegment:latest
 
 # 3) 读 image config（不落盘）
 ctr -n k8s.io content get <CONFIG_DIGEST> | jq '{architecture, os, config, history}'
 
 # 4) 读最上层 layer 的 tar 列表（不落盘；按实际压缩格式调整）
 ctr -n k8s.io content get <LAYER_DIGEST> | tar -tzf - \
-  | grep -E 'nof|spdk|nvme_urma|outputs/bin|mooncake_client|check-mooncake' || true
+  | grep -E 'nof|spdk|nvme_urma|nvmf|rpc.py|vsegment|outputs/bin|mooncake_client|check-mooncake' || true
 ```
 
 注意：
@@ -318,8 +345,9 @@ kubectl -n mooncake-memory-pressure get ds -o wide 2>/dev/null || true
 
 #### 回执要求
 
-1. 镜像文件级结论：`nof_register` / `nof_unregister` / `mooncake_client` / SPDK 头/lib
-   各自 **有 / 无 / 无法确认**（附 layer 路径证据）。
+1. 新镜像文件级结论：`nof_register` / `nof_unregister` / `mooncake_client` / `mooncake_master` /
+   SPDK 头/lib / `nvmf_tgt` / SPDK RPC / target 启动脚本 各自 **有 / 无 / 无法确认**
+   （附 layer 路径证据）；同时给 10 节点 `mooncake-runtime-nof-vsegment:latest` 的 digest 一致性。
 2. live DS 三个探针的实际 `failureThreshold / periodSeconds / timeoutSeconds`，与仓库 YAML 对比。
 3. `vwci` / `vcmic` / `mnan` 实际值；`vwci=0` 是否意味着不支持标准 VMC。
 4. 新基线：recall / memory-pressure 的创建时间、DS 数、Pod 数；是否像 Services-Deployment 创建的。
@@ -356,3 +384,4 @@ kubectl -n mooncake-memory-pressure get ds -o wide 2>/dev/null || true
 | 2026-11-17 | NOF-002 完成（CrashLoop 瞬态自愈；镜像元数据无 NoF；SR-IOV `vwci=0`；环境新增 recall+pressure）；下发 NOF-003 镜像文件级只读查验；数据盘不均视为临时状态，不作为方案约束 |
 | 2026-11-17 | 用户确认设计决策：10 节点按 10 推进、组 k8s 时移除 2 盘节点；管理端只感知 master；k8s-4/5/6 全部实现（先 k8s-4）；k8s-6 共用一个 master；分盘以整盘为最小单位，不做 VF/1/3 |
 | 2026-11-17 | **bring-up 简化**：每个 target Pod 先只分 1 块整盘（k8s-4 rank 1 块、recall 两个 target 各 1 块；k8s-6 单个 target 也先 1 块）；后续再扩多块；`DISKS_PER_TARGET` 可配 |
+| 2026-11-18 | 同事产出 NoF-vsegment 镜像 `mooncake-runtime-nof-vsegment:202611180847.cb1d25e7` 并分发 10 节点；NOF-003 改为查验该镜像（含 `nvmf_tgt`/SPDK/`nof_register`/target 脚本 + 10 节点 digest 一致性） |
