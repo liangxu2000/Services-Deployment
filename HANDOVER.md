@@ -107,6 +107,11 @@
 - **任何临时文件（包括 `/tmp`）**
 - 把任何结果写回仓库或 push
 
+- **hugepages 铁律（2026-11-18 NOF-009 实测）**：宿主默认页型是 **512MiB**
+  （`Hugepagesize: 524288 kB`），不是 2MiB。任何 `nr_hugepages` 写入前必须先读 `Hugepagesize`
+  并按页型换算；**禁止再写 2048 页（=1TiB）**。target 的 bring-up 用 `--no-huge -s 2048`，
+  不写宿主 hugepages；master 若需要，按 8 × 512MiB = 4GiB 计算。
+
 > 如果某项检查必须变更集群才能做，报 `BLOCKED`，等下一轮任务授权。
 
 ---
@@ -252,8 +257,9 @@
 | NOF-005 | 本地 k8s_deploy 产物只读盘点 | **DONE** | 2026-11-18 |
 | NOF-006 | 从同事文档提取 target takeover / k8s-2 改造规格（只读） | **DONE** | 2026-11-18 |
 | NOF-007 | 前置探查 + node1 规格核对（只读） | **DONE** | 2026-11-18 |
-| NOF-008 | 分发 1156 到 worker09（写） | **延后（PoC 不需要；worker02 已有 1156）** | 2026-11-18 |
-| NOF-009 | 单节点 -Z PoC（worker10，写） | **待用户授权（下一步）** | 2026-11-18 |
+| NOF-008 | 分发 1156 到 worker09（写） | **延后（worker09 ImageGC 僵持）** | 2026-11-18 |
+| NOF-009 | 单节点 -Z PoC（worker10，写） | **DONE（target 通；master SPDK init 失败）** | 2026-11-18 |
+| NOF-010 | master 二进制/SPDK 链接只读诊断 | **已下发（本轮）** | 2026-11-18 |
 
 ---
 
@@ -367,9 +373,52 @@
 - **`preflight_check.sh` 是破坏性的**（kill master/清 etcd/`rm -rf /var/lib/etcd`/还原盘），**禁止运行**；
   `probe-nof-prereq.sh` 的 ssh 缺 `-n`，复用需补。
 
+### NOF-009 单节点 -Z PoC（DONE，2026-11-18）
+
+- 栈：worker10 临时 namespace；etcd/master/target 全用 1156，hostNetwork + privileged + /dev + /sys；
+  etcd ready；master leader、1024/1024 slots；target `nvmf_tgt` RPC ready，
+  `bdev_null_create Null0 1048576 4096`，URMA listener `141.62.32.59:4420`。
+- `nof_register` 4/4 次 exit 0（**假成功**）；target 侧 `nvmf_tgt.log` 完全没有 accept/handshake。
+- master `MountNoFSegment_slow rc[-101]` 4/4 次；根因日志：
+  `Invalid opts->opts_size 0 too small` → `EAL rte_service_init failed` →
+  `spdk_env_init failed` → `init_rc=-12` → `rc[-101]`。
+- 源码 9b86170a 的 `spdk_wrapper.cpp` **已有** `spdk_env_opts_init(&opts)`（L190-191），
+  日志行 227 也匹配 → 怀疑 **master 二进制与运行时 libspdk 版本/ABI 不匹配**（或 master 未重编）。
+- hugepages：宿主默认 **512M 页**（`Hugepagesize: 524288 kB`）；takeover 的 `HUGE_PAGES=2048`
+  会写 1TiB，已即时回退；最终 0。
+- target 的 Pod 内补丁（已获 Dev Agent 追认）：`HUGE_PAGES=0` +
+  `nvmf_tgt --no-huge -s 2048`；target 成功，宿主 hugepages 未被改。
+- 其他实测：master 需要 `LD_LIBRARY_PATH=/home/Mooncake/outputs/lib`；etcd/master/target 可同镜像 1156；
+  镜像缺 `ip/ss/lspci/modprobe`（`-Z` 不受影响；real-disk 会因缺 lspci/modprobe 失败）。
+- 回退完成：namespace 删除、hugepages 0、内存/端口/SPDK 残留/vfio 均恢复；其他 namespace 未受影响。
+- **结论：target/URMA/注册命令链路 OK；唯一阻塞是 master 侧 SPDK init。**
+
 ---
 
 ## 6. 当前任务
+
+### NOF-010 master 二进制/SPDK 链接只读诊断（本轮执行，只读）
+
+**上一轮结论**：target 侧 OK；master 在自身 SPDK init 阶段失败（`opts_size=0`、`init_rc=-12`、
+`rc[-101]`），根本没连 target；源码 9b86170a 已有 `spdk_env_opts_init`。
+
+**本轮目标**：只读确认 master 失败是「动态 libspdk 版本/ABI 不匹配」还是「master 二进制未重编」：
+
+1. 从 1156 镜像/tar 里定位 `mooncake_master`，看 ELF NEEDED：
+   `tar -xOf ... | readelf -d /dev/stdin` 或 `objdump -p -`（不落盘；不支持就报 BLOCKED）；
+2. `strings` 搜 `libspdk`、`spdk_env_opts_init`、`spdk_env_init`、`spdk_env_opts`；
+3. 列镜像内 `libspdk*` 文件：`/usr/local/lib`、`/home/Mooncake/outputs/lib`、`/home/mooncake/spdk/lib`，
+   记录版本/大小/MD5；
+4. 对照 `nof_register`（静态链 SPDK）和 `nvmf_tgt`（SPDK 自带）的依赖差异；
+5. 看 master 是否有 build-id/timestamp，和 1156/9b86170a 是否对得上。
+
+**授权**：只读；允许 `tar -xOf | strings/readelf/objdump`（纯管道，不落盘）、`ls/stat/md5sum`。
+禁止：解包到磁盘、运行 master、起 Pod、`kubectl exec`、改镜像、任何临时文件。
+
+**输出**：master 的 NEEDED 列表；是否动态链 `libspdk`；镜像内 libspdk 版本；
+与 `nof_register`/`nvmf_tgt` 对比；结论「ABI/版本不匹配 / master 未重编 / 其他」；BLOCKED。
+
+---
 
 ### NOF-008 分发 1156 到 worker09（延后，不要执行）
 
@@ -394,7 +443,7 @@ k8s-4 的 etcd/master/target Pod 一律调度到 worker（7 台 worker 已有镜
 - **不要碰 master；不要 import 到 master。**
 - **用户未明确授权前，不要执行。**
 
-### NOF-009 单节点 -Z PoC（待用户授权，不要执行）
+### NOF-009 单节点 -Z PoC（DONE，本轮不执行）
 
 > **不需要先做 NOF-008**：worker10 已有 1156；本轮只在 worker10 上建临时栈。
 > **worker02 不可用**（2026-11-18 15:14 后主机失联，非本任务导致）；不恢复、不使用。
@@ -658,13 +707,16 @@ tar -xOf "$TAR" "$LAYER" \
 
 > 不要在 NOF-004 中执行以下任务，等对应任务号下发。
 
-- `NOF-008` / `NOF-009`：见「当前任务」，**待用户授权**。
-- `NOF-010`：`k8s-4` NoF rank 部署（每节点 1 个 target，bring-up 先 1 块整盘；
+- `NOF-008` / `NOF-009`：NOF-008 延后；NOF-009 已完成（target 通，master SPDK init 失败）。
+- `NOF-011`：修 master 的 SPDK init（ABI/库不匹配或重编），产出新镜像；
+  需同事/编译环境，先等 NOF-010 诊断。
+- `NOF-012`：重跑单节点 `-Z` PoC，确认 `MountNoFSegment_slow rc[0]`。
+- `NOF-013`：`k8s-4` NoF rank 部署（每节点 1 个 target，bring-up 先 1 块整盘；
   建议排除 master，worker03 只有 1 块盘可跑 rank）
-- `NOF-011`：`k8s-4` NoF recall 部署（每节点 2 个 target；端口/NQN 用
+- `NOF-014`：`k8s-4` NoF recall 部署（每节点 2 个 target；端口/NQN 用
   `run_vesegment_target.sh` 的 awk 补丁方案；**worker03 只有 1 块空闲盘，需排除**）
-- `NOF-012`：`k8s-5` NoF 加压（复用 k8s-3，切到 NoF namespace）
-- `NOF-013`：`k8s-6` combined（每节点 1 个 target，bring-up 先 1 块盘，rank+recall 共用一个 master）
+- `NOF-015`：`k8s-5` NoF 加压（复用 k8s-3，切到 NoF namespace）
+- `NOF-016`：`k8s-6` combined（每节点 1 个 target，bring-up 先 1 块盘，rank+recall 共用一个 master）
 
 ---
 
@@ -687,3 +739,4 @@ tar -xOf "$TAR" "$LAYER" \
 | 2026-11-18 | NOF-007 完成：实际 9 节点；盘/BDF/URMA 实测；node1 端口/NQN 已有 awk 补丁方案；`nof_register` 参数确认（master ip:port、capacity 100GiB）；实际镜像 1156 已分发 7 台、master/worker09 缺失；`preflight_check.sh` 破坏性禁止运行。NOF-008/009 进入待授权 |
 | 2026-11-18 | **NOF-008 延后**：首 PoC 在 worker02（已有 1156），不需要先分发；master 99% 满，永不导镜像。**NOF-009 优先**：worker02 上建临时 namespace + etcd + master + 1 个 `-Z` target，不碰真实盘 |
 | 2026-11-18 | **worker02 主机失联**（15:14 后，非本任务导致），PoC 改到 **worker10**；授权写一次 worker10 的 `nr_hugepages`（~4.5GiB，回退 0）；NOF-009 仍待用户授权。worker09 ImageGC 僵持，NOF-008 继续延后 |
+| 2026-11-18 | NOF-009 完成：target/`nvmf_tgt`/URMA/`nof_register` 全通；master `MountNoFSegment rc[-101]`，根因 `opts_size=0`/SPDK init 失败；宿主默认 512M hugepage，1TiB 写入已即时回退；target 用 `--no-huge -s 2048`；回退干净。下发 NOF-010 只读诊断 master 二进制/SPDK 链接 |
