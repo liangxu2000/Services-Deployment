@@ -35,7 +35,7 @@
 | 首次拉取 | `git clone --branch nof-ssd https://github.com/liangxu2000/Services-Deployment.git` |
 | 后续每轮 | `git pull` |
 | 任务编号 | `NOF-001` 起递增；每轮只做消息中指定的编号，不要提前做后续任务 |
-| 环境 | **2026-11-18 重建后实测 12 节点**（master + worker01…worker11）；最终节点集待用户确认 |
+| 环境 | **2026-11-18 实测 9 节点**（master + worker02/03/05/06/07/08/09/10；worker01/04/11 不在）；最终节点集待用户确认 |
 | 结果通道 | 本轮会话（不回写仓库） |
 
 **角色分工（硬性）**：
@@ -233,6 +233,9 @@
   `ss -ltn :4420`；`ldd nof_register` 无 not found。
 - 镜像：**1103**（6,643,408,896 B，含 target）未分发；0847 不含 target。
 - **`-Z` Null bdev** 是首 PoC 最安全路径：不碰盘，先验证 `nvmf_tgt` + `nof_register` + master 挂载。
+- **master 磁盘风险（2026-11-18 NOF-008 核对）**：master 根盘 2.9T 已用 99%（49G 可用），
+  containerd 数据 12G；`evictionHard` 不监控 nodefs，不会报 DiskPressure；imageGC 默认 85% 可能回收。
+  **不要往 master 导镜像/落大文件**；k8s-4 的 etcd/master/target 一律调度到 worker。
 
 ---
 
@@ -366,22 +369,36 @@
 
 ## 6. 当前任务
 
-### NOF-008 分发 1156 到缺失节点（待用户授权，不要执行）
+### NOF-008 分发 1156 到 worker09（待用户授权，不要执行）
 
-- 目标：master + worker09（如最终节点集含它们）导入 `202611181156.9b86170a` 并打 latest；
-  或统一全部 9 节点。
-- 写操作：`ctr image import`；源 tar 在 controller `/home/yin/downloads/`（已有 1156）。
-- 回退：记录导入前镜像列表；如需回退，删除新增 tag（需单独授权）。
+**决策（Dev Agent）**：**只补 worker09，不碰 master**。master 根盘 99% 满（49G 可用），
+导入 6.6G content + 约 6.6G 解包 ≈ 13G，且 imageGC 默认 85% 可能回收；master 是控制面，不冒这个险。
+k8s-4 的 etcd/master/target Pod 一律调度到 worker（7 台 worker 已有镜像；补 worker09 后 8 台 worker 都有）。
+
+- 源 tar：controller `/home/yin/downloads/mooncake-runtime-nof-vsegment-202611181156.9b86170a.tar`
+  （6,646,642,688 B，sha256 `58a718b8…`）。
+- 步骤（逐条可停）：
+  1. 记录 worker09 导入前 `crictl images` 快照；
+  2. `scp` tar 到 worker09 的 `/home/yin/downloads/`（**唯一授权的临时文件**，6.6G）；
+  3. worker09 `sha256sum` 校验 `58a718b8…`；
+  4. `ctr -n k8s.io images import <tar>`（不用 `--no-unpack`；worker09 剩 525G，正常解包）；
+  5. `ctr -n k8s.io images tag --force docker.io/library/mooncake-runtime-nof-vsegment:202611181156.9b86170a docker.io/library/mooncake-runtime-nof-vsegment:latest`；
+  6. `crictl inspecti` 校验 tag 与 latest 的 id = `sha256:7dda528a…`；
+  7. 删除 worker09 上的 tar（**授权的清理**；回退需重新 scp）。
+- 回退：`ctr -n k8s.io images rm` 两个 tag；不影响 w00921547 与既有 Pod。
+- **不要碰 master；不要 import 到 master。**
 - **用户未明确授权前，不要执行。**
 
 ### NOF-009 单节点 -Z PoC（待用户授权，不要执行）
 
-- 目标：在一个 worker（建议 worker02）用 1156 起最小栈（etcd + master + 1 个 target Pod）：
+- 目标：在 **worker02** 用 1156 起最小栈（临时 namespace `mooncake-nof-poc`：etcd + master + 1 个 target Pod）：
+  - etcd/master/target 都用 `nodeSelector kubernetes.io/hostname=worker02`，确保镜像已在；
   - 建 `build/bin/nvmf_tgt` 符号链；
   - takeover `-Z -p urma -L /usr/lib64 -N <urma_dev> -i <pod_ip> -m 0x3 -y`；
   - `nof_register <nqn> 1 <pod_ip> <port> URMA <master_ip:port> 107374182400`；
   - 验收：master 日志 `MountNoFSegment_slow rc[0]`。
 - **不碰任何真实盘**；hugepages 由 takeover 上调（写 `/proc/sys`），Pod 需 privileged。
+- 如果 Pod IP 作为 `-i` 失败：改用 `hostNetwork: true` + 节点 fabric IP（`dnsPolicy: ClusterFirstWithHostNet`）。
 - 回退：删除临时 namespace/Pod；`nr_hugepages` 恢复基线 0；释放 vfio。
 - **用户未明确授权前，不要执行。**
 
