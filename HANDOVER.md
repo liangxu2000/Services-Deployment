@@ -259,7 +259,9 @@
 | NOF-007 | 前置探查 + node1 规格核对（只读） | **DONE** | 2026-11-18 |
 | NOF-008 | 分发 1156 到 worker09（写） | **延后（worker09 ImageGC 僵持）** | 2026-11-18 |
 | NOF-009 | 单节点 -Z PoC（worker10，写） | **DONE（target 通；master SPDK init 失败）** | 2026-11-18 |
-| NOF-010 | master 二进制/SPDK 链接只读诊断 | **已下发（本轮）** | 2026-11-18 |
+| NOF-010 | master 二进制/SPDK 链接只读诊断 | **DONE（根因：opts 未初始化，2 行修复）** | 2026-11-18 |
+| NOF-011 | 修 master `opts_size` 并重编镜像 | **等待同事/编译环境（阻塞）** | 2026-11-18 |
+| NOF-012 | 重跑 -Z PoC 验证 master 挂载 | **待新镜像** | 2026-11-18 |
 
 ---
 
@@ -393,11 +395,49 @@
 - 回退完成：namespace 删除、hugepages 0、内存/端口/SPDK 残留/vfio 均恢复；其他 namespace 未受影响。
 - **结论：target/URMA/注册命令链路 OK；唯一阻塞是 master 侧 SPDK init。**
 
+### NOF-010 master 二进制/SPDK 诊断（DONE，2026-11-18）
+
+- **根因（源码级）**：`mooncake-store/src/spdk/spdk_wrapper.cpp` L190
+  `struct spdk_env_opts opts;` **未初始化**；SPDK v26.09 的 `spdk_env_opts_init()`
+  会先读 `opts->opts_size` 再 memset/写回，**不设 `sizeof(*opts)`**；调用方栈垃圾（运行时 0）
+  → `spdk_env_init` 报 `Invalid opts->opts_size 0 too small` → EAL 退化 → `init_rc=-12/-14`
+  → `MountNoFSegment rc[-101]`。
+- **排除**：master NEEDED 无任何 `libspdk`（SPDK 静态链入）；三个二进制 SPDK 版本/函数尺寸一致；
+  头文件与库 MD5 一致；master 是 11:55 新编的；SPDK 符号各只有一份。
+- **最小修复（2 行）**：
+  ```
+  -    struct spdk_env_opts opts;
+  +    struct spdk_env_opts opts = {};
+       spdk_env_opts_init(&opts);
+  +    opts.opts_size = sizeof(opts);
+  ```
+- 修复后 master 的 EAL 仍可能因 512M hugepage 供给失败；下一轮 PoC 用 8×512M=4GiB（禁止 2048 页），
+  必要时在 wrapper 里设 `opts.no_huge = true`。
+- 另：master NEEDED `liburma.so`（无版本后缀），镜像需有 `/usr/lib64/liburma.so`；
+  master 需 `LD_LIBRARY_PATH=/home/Mooncake/outputs/lib`。
+
 ---
 
 ## 6. 当前任务
 
-### NOF-010 master 二进制/SPDK 链接只读诊断（本轮执行，只读）
+### NOF-011 修 master `opts_size` 并重编镜像（等待同事/编译环境，当前不可执行）
+
+- 改动：fork `mooncake-store/src/spdk/spdk_wrapper.cpp` 的 2 行（见 NOF-010 摘要）：
+  `struct spdk_env_opts opts = {};` + `opts.opts_size = sizeof(opts);`。
+- 构建：用 node1 的 `mooncake-vesegment` 源码 + `spdk-cpu`，重编 `mooncake_master`，
+  重打 runtime 镜像（新 tag；保留 1156 回退）。
+- 验收：新 master 启动不再出现 `opts_size 0 too small`；`MountNoFSegment_slow` 走到 rc[0]。
+- **需要同事/编译环境执行；测试 Agent 不改源码、不编译。**
+
+### NOF-012 重跑 -Z PoC（待新镜像，不要执行）
+
+- 用新镜像重跑 NOF-009 的 worker10 流程；hugepages 按 **512M 池 8 页（4GiB）** 或 master `opts.no_huge`；
+- 验收 `MountNoFSegment_slow rc[0]`；回退同 NOF-009。
+- **用户未明确授权前，不要执行。**
+
+---
+
+### NOF-010 master 二进制/SPDK 链接只读诊断（DONE，本轮不执行）
 
 **上一轮结论**：target 侧 OK；master 在自身 SPDK init 阶段失败（`opts_size=0`、`init_rc=-12`、
 `rc[-101]`），根本没连 target；源码 9b86170a 已有 `spdk_env_opts_init`。
@@ -707,10 +747,8 @@ tar -xOf "$TAR" "$LAYER" \
 
 > 不要在 NOF-004 中执行以下任务，等对应任务号下发。
 
-- `NOF-008` / `NOF-009`：NOF-008 延后；NOF-009 已完成（target 通，master SPDK init 失败）。
-- `NOF-011`：修 master 的 SPDK init（ABI/库不匹配或重编），产出新镜像；
-  需同事/编译环境，先等 NOF-010 诊断。
-- `NOF-012`：重跑单节点 `-Z` PoC，确认 `MountNoFSegment_slow rc[0]`。
+- `NOF-008`：延后；`NOF-009` / `NOF-010` 已完成。
+- `NOF-011` / `NOF-012`：见「当前任务」，等待新镜像/授权。
 - `NOF-013`：`k8s-4` NoF rank 部署（每节点 1 个 target，bring-up 先 1 块整盘；
   建议排除 master，worker03 只有 1 块盘可跑 rank）
 - `NOF-014`：`k8s-4` NoF recall 部署（每节点 2 个 target；端口/NQN 用
@@ -740,3 +778,4 @@ tar -xOf "$TAR" "$LAYER" \
 | 2026-11-18 | **NOF-008 延后**：首 PoC 在 worker02（已有 1156），不需要先分发；master 99% 满，永不导镜像。**NOF-009 优先**：worker02 上建临时 namespace + etcd + master + 1 个 `-Z` target，不碰真实盘 |
 | 2026-11-18 | **worker02 主机失联**（15:14 后，非本任务导致），PoC 改到 **worker10**；授权写一次 worker10 的 `nr_hugepages`（~4.5GiB，回退 0）；NOF-009 仍待用户授权。worker09 ImageGC 僵持，NOF-008 继续延后 |
 | 2026-11-18 | NOF-009 完成：target/`nvmf_tgt`/URMA/`nof_register` 全通；master `MountNoFSegment rc[-101]`，根因 `opts_size=0`/SPDK init 失败；宿主默认 512M hugepage，1TiB 写入已即时回退；target 用 `--no-huge -s 2048`；回退干净。下发 NOF-010 只读诊断 master 二进制/SPDK 链接 |
+| 2026-11-18 | NOF-010 完成：根因定位为 `spdk_wrapper.cpp` 的 `struct spdk_env_opts opts;` 未初始化（SPDK v26.09 的 `spdk_env_opts_init` 不补 `opts_size`）；2 行修复。NOF-011/012 等待同事重编新镜像后执行 |
