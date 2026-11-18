@@ -160,7 +160,8 @@
 | NOF-001 | 环境摸底（只读） | **DONE** | 2026-11-17 |
 | NOF-002 | 基线故障 + 镜像/ SR-IOV 只读深挖 | **DONE** | 2026-11-17 |
 | NOF-003 | 新 NoF 镜像只读查验 + 探针/虚拟化能力核对 | **DONE** | 2026-11-18 |
-| NOF-004 | NoF target 路线只读识别 + 新集群基线记录 | **已下发** | 2026-11-18 |
+| NOF-004 | NoF target 路线只读识别 + 新集群基线记录 | **暂停（先盘点本地产物）** | 2026-11-18 |
+| NOF-005 | 本地 k8s_deploy 产物只读盘点 | **已下发（本轮）** | 2026-11-18 |
 
 ---
 
@@ -233,7 +234,64 @@
 
 ## 6. 当前任务
 
-### NOF-004 NoF target 路线只读识别 + 新集群基线记录
+### NOF-005 本地 k8s_deploy 产物只读盘点（本轮执行）
+
+**背景**：同事在测试 Agent 所在机器留下了一份 k8s 部署产物目录；
+完整路径由本轮会话消息给出（HANDOVER 在公开仓库，路径不写死）。
+如果消息里没有路径 → 报 `BLOCKED`，不要猜。
+
+**授权边界**：只读本地文件。允许 `ls / dir / Get-ChildItem / find`、`cat / type / Get-Content`、
+`file`、`stat`。禁止：执行任何脚本/二进制；`kubectl apply`；修改/删除/移动/重命名文件；
+解压 tar/镜像；把文件内容写回仓库；把密码/token/内网 IP 原样贴出（标 `redacted`）。
+
+**步骤**：
+
+#### A. 目录清单（Windows PowerShell 或 Git Bash 二选一）
+
+```powershell
+Get-ChildItem -LiteralPath '<LOCAL_ARTIFACT_DIR>' -Recurse -File |
+  Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize
+```
+
+```bash
+find '<LOCAL_ARTIFACT_DIR>' -type f -printf '%p\t%s\t%TY-%Tm-%Td %TH:%TM\n' | sort
+```
+
+如果路径不存在：列出上一级目录，报 `BLOCKED`。
+
+#### B. 分类阅读（只读文本；二进制/大文件只列名字和大小）
+
+- `.yaml/.yml/.json`：k8s manifest；记录 kind/name/namespace、image、env、volumes、
+  resources、securityContext、device mounts、hugepages、nodeSelector。
+- `.sh/.py/.ps1/.bat`：只读文本；记录用途、参数、关键命令；**不要执行**。
+- `.md/.txt/README`：总结工作流、前置条件、步骤。
+- `.tar/.img/.bin/.exe` 等：只列名字/大小，不读取/解压/执行。
+
+#### C. 重点找（与 NoF 相关）
+
+- NoF target 的启动/注册方式：`nof_register`、`spdk_tgt_create.py`、`nvmf_tgt`、NQN、
+  `traddr/trsvcid/trtype`（是否 URMA）、`/home/spdk`。
+- `MC_NOF_*`、`MC_MEM_*`、`vsegment`、`enable_offload`、`GLOBAL_SEGMENT_SIZE`。
+- 镜像名/tag（是否 `mooncake-runtime-nof-vsegment`）。
+- 是 k8s-2 的修改，还是 k8s-4/5/6 的新服务；namespace 命名。
+- 设备挂载：vfio、hostPath、`/dev/nvme*`、hugepages、privileged。
+- 是否包含 README/步骤文档，能直接说明同事的意图。
+
+#### D. 输出
+
+1. 文件清单表：路径、类型、大小、一句话用途。
+2. 关键发现：按 C 的重点逐条列。
+3. 与当前仓库 `services/k8s-2` 的差异摘要（如果能对照；不要修改仓库）。
+4. 敏感信息只标 `redacted`。
+5. `BLOCKED` 项。
+
+> 再次强调：**不执行、不修改、不解压、不落盘**。
+
+---
+
+### NOF-004 NoF target 路线只读识别 + 新集群基线记录（暂停，等 NOF-005 结果）
+
+> 本轮不要执行 NOF-004；先做 NOF-005。若已执行，保留回执，不冲突。
 
 **上一轮结论**：集群重建为 12 节点、无 mooncake 镜像/资源；新镜像自带走 NoF 注册/客户端二进制，
 SPDK 静态链入 `nof_register`，但镜像内没有 `nvmf_tgt`/SPDK 头/lib；`vwci` 解释已修正。
@@ -341,3 +399,4 @@ tar -xOf "$TAR" "$LAYER" \
 | 2026-11-17 | **bring-up 简化**：每个 target Pod 先只分 1 块整盘；后续再扩多块；`DISKS_PER_TARGET` 可配 |
 | 2026-11-18 | 同事产出 NoF-vsegment 镜像；NOF-003 改为查验新镜像 |
 | 2026-11-18 | NOF-003 完成：集群重建为 12 节点、镜像未导入；镜像含 `nof_register`/客户端、SPDK 静态链入 `nof_register`、无 `nvmf_tgt`；**修正 `vwci` 误读（OACS bit1=1 支持 VMC）**；下发 NOF-004 只读识别 target 路线；新增“禁止任何临时文件” |
+| 2026-11-18 | 用户提供同事本机 `k8s_deploy` 产物目录；NOF-004 暂停，下发 NOF-005 只读盘点（完整路径不进公开仓库，由会话消息提供） |
