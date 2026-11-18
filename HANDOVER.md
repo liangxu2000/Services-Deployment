@@ -181,6 +181,55 @@
 - **k8s-2/3**：同事**完全未改**（k8s-2 12/12 文件与上游逐字节相同）；`k8s-4/5/6` 不存在。
 - **节点口径**：文档写 10、`cluster.json` 写 `k8s-controller-16nodes`、实际 12；后续统一，不硬编码。
 
+**3.4 NOF-006 提取的实现规格（2026-11-18）**
+
+**target 启动（takeover 脚本）**
+
+- 本机副本：`target_nvme_takeover.sh` 36,054 B，MD5 `19893fb9…`；
+  与 node1 版本行号不一致（node1 引用 §513-569，本机 490-558），**实现前必须核对 node1 版**。
+- 关键参数：
+  - `-d <nvmeXn1>` 目标盘（逗号/重复）；默认只分析；`-r` 还原；`-Z` Null bdev 自测（1TiB，不碰盘）。
+  - `-p urma` **必须显式给**（默认 tcp）；`-L /usr/lib64`（默认是 GDR 路径）；`-N <urma_dev>`（默认 `udmac0d1e2`）。
+  - `-i <fabric_ip>`、`-m <core mask>`、`-I 8192,8192,1024,8388608`、`-O 8388608`、`-C 64`。
+  - `-R <strip_kb>` raid0；bring-up 单盘不用。
+- `nvmf_tgt`：`$SPDK_DIR/build/bin/nvmf_tgt` + `scripts/rpc.py` 必须存在；
+  `nohup ... > /tmp/nvmf_tgt.log &`，PID `/var/tmp/nvmf_tgt.pid`；就绪用 `rpc_get_methods` 30s。
+- vfio-pci noiommu：`modprobe vfio vfio_pci`；`enable_unsafe_noiommu_mode=1`；
+  `driver_override=vfio-pci`；unbind nvme / bind vfio-pci；必须 root；BDF 每次现查。
+- hugepages：基线 2048（4GiB@2MB）；`-I` 时按池上调；写 `/proc/sys/vm/nr_hugepages`；Pod 必须 privileged。
+- **端口/NQN 写死**：`LISTEN_PORT=4420`、`NQN=nqn.2026-01.io.spdk:urma-gpu-test`、
+  `SUBSYS_SN=URMAGPU0001`，**无选项**。
+  → rank 1 target/节点可用默认；**recall 2 target/节点必然冲突**，需加 `-P/-Q` 或每 Pod 改脚本副本。
+- **镜像路径 bug**：STEP 5.6 放在 `/home/mooncake/spdk/bin/nvmf_tgt`，脚本校验
+  `$SPDK_DIR/build/bin/nvmf_tgt`；启动脚本需建 `build/bin/nvmf_tgt` 符号链（容器内可写层），
+  或改用匹配布局。
+
+**store Pod 进程**
+
+- 顺序：takeover → `nvmf_tgt` → `nof_register <nqn> 1 <traddr> <trsvcid> URMA <master_addr> <size_bytes>`。
+- **`mooncake_client` 不在 NoF store 链路里**（文档明确从 `exec mooncake_client` 改为上面三步）；
+  client/压测侧才用 `mooncake_client`。
+- `nof_register` 的 `<master_addr>` 形态、`<size_bytes>` 计算、NQN 一致性：**文档未给**，
+  需 node1 `vseg_scripts` / `vsegment_cluster.sh`。
+
+**k8s 改造**
+
+- namespace：`mooncake-nof-rank` / `mooncake-nof-recall`。
+- master flags：`--cvm_segments_vsegment_exclusive=true --vsegment_auto_plan=true
+  --vsegment_required_medium=nof --vsegment_io_alignment=4096 --vsegment_member_count=1
+  --vsegment_member_extent_size=67108864 --vsegment_stripe_size=2097152 --vsegment_reserved_ratio=0`。
+- env：`MC_STORE_PARTITION_SLOT_COUNT=1024`、`MOONCAKE_VSEGMENT_METRICS_REFRESH_INTERVAL_MS=1000000`、
+  `SPDK_URMA_DEV_NAME`、`SPDK_URMA_CAPSULE_TRANSPORT=urma`；client 侧 `MC_NOF_SUBMIT_CHUNK_BYTES`、
+  `MC_NOF_INFLIGHT_BYTES_LIMIT`、`MC_NOF_WORKERS=4`、`MC_URMA_*`、`URMA_RPC_*`。
+- **禁用** `MC_NOF_REPLICA_NUM` / `MC_MEM_REPLICA_NUM`（vsegment + medium=nof 下会打架）。
+- `cluster_id=mooncake_cluster_nof`。
+- YAML：`privileged: true`；hostPath `/sys`；UB=1 + memory；每节点一块空闲 3.5T（排除 mounted>0）；
+  探针不用 17704。
+- 验收：master 日志 `MountNoFSegment_slow rc[0]`；`nof_register` exit 0 是假成功；
+  `ss -ltn :4420`；`ldd nof_register` 无 not found。
+- 镜像：**1103**（6,643,408,896 B，含 target）未分发；0847 不含 target。
+- **`-Z` Null bdev** 是首 PoC 最安全路径：不碰盘，先验证 `nvmf_tgt` + `nof_register` + master 挂载。
+
 ---
 
 ## 4. 任务索引
@@ -192,7 +241,8 @@
 | NOF-003 | 新 NoF 镜像只读查验 + 探针/虚拟化能力核对 | **DONE** | 2026-11-18 |
 | NOF-004 | NoF target 路线只读识别 + 新集群基线记录 | **已取消（NOF-005 已回答路线：外部 nvmf_tgt）** | 2026-11-18 |
 | NOF-005 | 本地 k8s_deploy 产物只读盘点 | **DONE** | 2026-11-18 |
-| NOF-006 | 从同事文档提取 target takeover / k8s-2 改造规格（只读） | **已下发（本轮）** | 2026-11-18 |
+| NOF-006 | 从同事文档提取 target takeover / k8s-2 改造规格（只读） | **DONE** | 2026-11-18 |
+| NOF-007 | 前置探查 + node1 规格核对（只读） | **已下发（本轮）** | 2026-11-18 |
 
 ---
 
@@ -274,11 +324,72 @@
 - BLOCKED：node1 上的 tar、spdk-cpu、`target_nvme_takeover.sh` 不在本地产物内；
   `data/tasks.json` 无运行日志/退出码；脚本未执行（语法/行为未验证）。
 
+### NOF-006 从同事文档提取规格（DONE，2026-11-18）
+
+- 已提取：takeover 参数、进程顺序、k8s-2 改造、验收判据、镜像 1103、探查脚本；详见 3.4。
+- **关键阻塞**：
+  1. 本机 takeover 副本与 node1 版本不一致，端口/NQN 是否已参数化未知；
+  2. `nof_register` 的 `<master_addr>` 形态、`<size_bytes>` 计算、NQN 一致性无来源；
+  3. node1 `vseg_scripts` / `vsegment_cluster.sh` 不可达；
+  4. 镜像 1103 路径 bug（`bin/` vs `build/bin/`）。
+- **观察**：`-Z` Null bdev 适合首 PoC；端口/NQN 写死使 recall 2 target/节点不可行；
+  hugepages 按池上调；多盘时 `member_count` 取值文档未回答。
+
 ---
 
 ## 6. 当前任务
 
-### NOF-006 从同事文档提取 target takeover / k8s-2 改造规格（本轮执行，只读）
+### NOF-007 前置探查 + node1 规格核对（本轮执行，只读）
+
+**上一轮结论**：NOF-006 提取了 target 规格；关键阻塞是 takeover 版本、端口/NQN 写死、
+`nof_register` 参数、镜像路径不匹配。
+
+**本轮目标**：
+
+1. 在 controller 上运行同事的只读前置探查 `probe-nof-prereq.sh`（+ `remote-probe-body.sh`），
+   得到当前每节点空闲 3.5T 盘/BDF、URMA 设备名、hugepages、vfio、SPDK 残留、fuser；
+2. 如能只读访问 node1，核对 `target_nvme_takeover.sh` 的 MD5/端口/NQN/参数化，
+   并读取 `vseg_scripts` / `vsegment_cluster.sh` 中 `nof_register` 的真实调用；
+3. 记录 1103 tar 位置与当前节点集。
+
+**授权边界**：只读。允许运行 `probe-nof-prereq.sh` / `remote-probe-body.sh`（其 body 全只读）、
+`ssh node1` 只读命令；禁止写盘、绑定 vfio、改 hugepages、`kubectl apply`、任何临时文件。
+
+#### A. 运行前置探查
+
+```bash
+# 在 controller 上、脚本所在目录
+export PROBE_B64=$(base64 -w0 remote-probe-body.sh)
+bash probe-nof-prereq.sh
+```
+
+如果脚本会写临时文件，先检查；如会写，改用只读命令手动采集，不要落盘。
+
+目标输出（每节点）：
+
+- 空闲 3.5T 数据盘：`mounted=0`、`holders` 空、`sub_parts=0`；
+- BDF：必要时补 `readlink -f /sys/block/<dev>/device`；
+- URMA 设备名（`urma_admin show`）；
+- hugepages、vfio 模块/`/dev/vfio`、SPDK 残留、fuser。
+
+#### B. node1 只读核对（如可达）
+
+- `md5sum /home/yin/nof/spdk/target_nvme_takeover.sh`；
+- 读关键行：`LISTEN_PORT`、`NQN`、`SUBSYS_SN`、getopts 是否有 `-P/-Q`；
+- 读 `vseg_scripts` / `vsegment_cluster.sh` 中 `nof_register` 的调用：
+  `<master_addr>` 形态（`ip:port` / `etcd://`）、`<size_bytes>` 计算、NQN 是否与 takeover 一致；
+- 记录 1103 tar 路径/大小。
+- 若不可达：`BLOCKED`，列出需要的文件/命令，不要尝试密码登录。
+
+#### C. 记录
+
+- 当前节点数/名称；是否仍有 2 盘节点；磁盘编号是否在重建后变化；
+- 回执：每节点盘/BDF 表、URMA 设备、hugepages、vfio、SPDK 残留；
+  node1 版本差异；`nof_register` 真实参数；1103 tar 位置；BLOCKED。
+
+---
+
+### NOF-006 从同事文档提取 target takeover / k8s-2 改造规格（DONE，本轮不执行）
 
 **上一轮结论**：NOF-005 确认 target 路线为「外部 `nvmf_tgt` 注入 Pod + `target_nvme_takeover.sh` +
 `nof_register`」；k8s-2/3 未改、k8s-4/5/6 不存在；镜像 1103 含 target 但未分发。
@@ -466,14 +577,15 @@ tar -xOf "$TAR" "$LAYER" \
 
 > 不要在 NOF-004 中执行以下任务，等对应任务号下发。
 
-- `NOF-007`：**重新 import/分发镜像 `202611181103.cb1d25e7` 到最终节点集**（写操作，需用户逐项授权；
+- `NOF-008`：**重新 import/分发镜像 `202611181103.cb1d25e7` 到最终节点集**（写操作，需用户逐项授权；
   注意 0847 不含 target，不能用于 target Pod）
-- `NOF-008`：**单节点 target-in-pod PoC**（按 3.3 规格：vfio-pci noiommu + `nvmf_tgt` + `nof_register`；
-  必须可逆：记录基线、失败回滚；只在一个 worker 上做）
-- `NOF-009`：`k8s-4` NoF rank 部署（每节点 1 个 target，bring-up 先 1 块整盘）
-- `NOF-010`：`k8s-4` NoF recall 部署（每节点 2 个 target，每个 target 先 1 块整盘）
-- `NOF-011`：`k8s-5` NoF 加压（复用 k8s-3，切到 NoF namespace）
-- `NOF-012`：`k8s-6` combined（每节点 1 个 target，bring-up 先 1 块盘，rank+recall 共用一个 master）
+- `NOF-009`：**单节点 target-in-pod PoC**：先用 `-Z` Null bdev 验证
+  `nvmf_tgt + nof_register + master MountNoFSegment` 全链路，再换真盘；
+  必须可逆：记录基线、失败回滚；只在一个 worker 上做
+- `NOF-010`：`k8s-4` NoF rank 部署（每节点 1 个 target，bring-up 先 1 块整盘）
+- `NOF-011`：`k8s-4` NoF recall 部署（每节点 2 个 target；需先解决端口/NQN 写死）
+- `NOF-012`：`k8s-5` NoF 加压（复用 k8s-3，切到 NoF namespace）
+- `NOF-013`：`k8s-6` combined（每节点 1 个 target，bring-up 先 1 块盘，rank+recall 共用一个 master）
 
 ---
 
@@ -491,3 +603,4 @@ tar -xOf "$TAR" "$LAYER" \
 | 2026-11-18 | NOF-003 完成：集群重建为 12 节点、镜像未导入；镜像含 `nof_register`/客户端、SPDK 静态链入 `nof_register`、无 `nvmf_tgt`；**修正 `vwci` 误读（OACS bit1=1 支持 VMC）**；下发 NOF-004 只读识别 target 路线；新增“禁止任何临时文件” |
 | 2026-11-18 | 用户提供同事本机 `k8s_deploy` 产物目录；NOF-004 暂停，下发 NOF-005 只读盘点（完整路径不进公开仓库，由会话消息提供） |
 | 2026-11-18 | NOF-005 完成：确认 target 路线为外部 `nvmf_tgt` 注入 Pod + `target_nvme_takeover.sh`（vfio-pci noiommu）+ `nof_register`；镜像 1103 含 target 但未分发；k8s-2/3 未改；k8s-4/5/6 不存在。NOF-004 取消，下发 NOF-006 只读提取实现规格 |
+| 2026-11-18 | NOF-006 完成：提取 takeover/进程顺序/k8s-2 规格；发现镜像路径 bug（`bin/` vs `build/bin/`）、端口/NQN 写死、`nof_register` 参数缺口；下发 NOF-007 只读前置探查 + node1 规格核对 |
