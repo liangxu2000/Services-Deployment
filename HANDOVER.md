@@ -132,9 +132,13 @@
    **全部要实现**；顺序：**k8s-4 rank/recall → k8s-5 → k8s-6**。
 4. **k8s-6**：rank 和 recall **共用一个 master**。
 5. **分盘**：以**整盘为最小单位**，不做 VF、不做每盘 1/3。
-   - k8s-4：每节点 3 个 target（rank 1 + recall 2），整盘按 **2/2/3**
-     （或按实际数据盘数尽量均分）；
-   - k8s-6：每节点 1 个 target，独占全部数据盘。
+   **bring-up 阶段每个 target Pod 只分 1 块整盘**（先打通，后续再扩多块）：
+   - k8s-4：每节点 3 个 target（rank 1 + recall 2），rank 用 1 块、recall 两个 target 各用 1 块；
+     需要每节点至少 3 块数据盘（2 盘节点组 k8s 时移除）。
+   - k8s-6：每节点 1 个 target，bring-up 也先只给它 1 块盘；后续可改为多块/全部。
+   - 实现口径：变量 `DISKS_PER_TARGET`（bring-up 默认 1）+ `DISK_INDEX` 映射；
+     系统盘/已挂载盘永不选取；数据盘按 BDF/序列号稳定排序后取第 N 块。
+   - 这是**功能 bring-up 口径**，不代表最终容量/带宽；性能测试前再扩多块盘。
 
 ---
 
@@ -335,10 +339,10 @@ kubectl -n mooncake-memory-pressure get ds -o wide 2>/dev/null || true
 - `NOF-005`：构建 runtime 镜像，校验 SPDK / NoF 二进制 / ldd
 - `NOF-006`：**单节点 target-in-pod PoC**（需要写授权：hugepages + 整盘设备直通/绑定；
   必须可逆：记录基线、失败回滚；只在一个 worker 上做）
-- `NOF-007`：`k8s-4` NoF rank 部署（每节点 1 个 target，整盘分配）
-- `NOF-008`：`k8s-4` NoF recall 部署（每节点 2 个 target，整盘分配）
+- `NOF-007`：`k8s-4` NoF rank 部署（每节点 1 个 target，**bring-up 先分 1 块整盘**）
+- `NOF-008`：`k8s-4` NoF recall 部署（每节点 2 个 target，**每个 target 先分 1 块整盘**）
 - `NOF-009`：`k8s-5` NoF 加压（复用 k8s-3，切到 NoF namespace）
-- `NOF-010`：`k8s-6` combined（每节点 1 个 target，rank+recall 共用一个 master）
+- `NOF-010`：`k8s-6` combined（每节点 1 个 target，bring-up 先分 1 块盘，rank+recall 共用一个 master；后续再扩全部盘）
 
 ---
 
@@ -351,3 +355,4 @@ kubectl -n mooncake-memory-pressure get ds -o wide 2>/dev/null || true
 | 2026-11-17 | NOF-001 完成（实测 10 节点）；下发 NOF-002 只读深挖；强化角色边界 |
 | 2026-11-17 | NOF-002 完成（CrashLoop 瞬态自愈；镜像元数据无 NoF；SR-IOV `vwci=0`；环境新增 recall+pressure）；下发 NOF-003 镜像文件级只读查验；数据盘不均视为临时状态，不作为方案约束 |
 | 2026-11-17 | 用户确认设计决策：10 节点按 10 推进、组 k8s 时移除 2 盘节点；管理端只感知 master；k8s-4/5/6 全部实现（先 k8s-4）；k8s-6 共用一个 master；分盘以整盘为最小单位，不做 VF/1/3 |
+| 2026-11-17 | **bring-up 简化**：每个 target Pod 先只分 1 块整盘（k8s-4 rank 1 块、recall 两个 target 各 1 块；k8s-6 单个 target 也先 1 块）；后续再扩多块；`DISKS_PER_TARGET` 可配 |
