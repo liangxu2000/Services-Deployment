@@ -148,6 +148,10 @@
   `/home/y00988740/Services-Deployment/k8s-1-distribute-image/...`。
   **需要等最终节点集确定后重新 import/分发（写操作，待授权）。**
 - NoF 服务部署时使用 `MOONCAKE_IMAGE=mooncake-runtime-nof-vsegment:latest`（重新打 tag 后）。
+- **node1 的角色**：node1 是同事的**构建/镜像源节点**，**独立于 k8s worker 集群**。
+  k8s-0 在 node1 编镜像/导 tar；k8s-1 在 controller 上用 `--remote` 从 node1 拉 tar，
+  再分发到 k8s 节点。node1 上还放了 `target_nvme_takeover.sh`、
+  `vseg_scripts` / `vsegment_cluster.sh`、`spdk-cpu` 等源材料。
 - 待与同事对齐：同事进度写的是「k8s-2 部署 rank/recall（NoF 参数改造）」，
   我们的计划是新增 `k8s-4`；部署前必须确认命名/命名空间。
 
@@ -353,7 +357,8 @@
 3. 记录 1103 tar 位置与当前节点集。
 
 **授权边界**：只读。允许运行 `probe-nof-prereq.sh` / `remote-probe-body.sh`（其 body 全只读）、
-`ssh node1` 只读命令；禁止写盘、绑定 vfio、改 hugepages、`kubectl apply`、任何临时文件。
+`ssh node1` 只读命令（**用户已授权；node1 地址由本轮消息给出，不写公开仓库**）；
+禁止写盘、绑定 vfio、改 hugepages、`kubectl apply`、任何临时文件。
 
 #### A. 运行前置探查
 
@@ -372,8 +377,9 @@ bash probe-nof-prereq.sh
 - URMA 设备名（`urma_admin show`）；
 - hugepages、vfio 模块/`/dev/vfio`、SPDK 残留、fuser。
 
-#### B. node1 只读核对（如可达）
+#### B. node1 只读核对（用户已确认可连；地址由本轮消息给出，不写公开仓库）
 
+- 先 `ssh <node1> true` 确认连通；不通报 `BLOCKED`。
 - `md5sum /home/yin/nof/spdk/target_nvme_takeover.sh`；
 - 读关键行：`LISTEN_PORT`、`NQN`、`SUBSYS_SN`、getopts 是否有 `-P/-Q`；
 - 读 `vseg_scripts` / `vsegment_cluster.sh` 中 `nof_register` 的调用：
@@ -604,3 +610,4 @@ tar -xOf "$TAR" "$LAYER" \
 | 2026-11-18 | 用户提供同事本机 `k8s_deploy` 产物目录；NOF-004 暂停，下发 NOF-005 只读盘点（完整路径不进公开仓库，由会话消息提供） |
 | 2026-11-18 | NOF-005 完成：确认 target 路线为外部 `nvmf_tgt` 注入 Pod + `target_nvme_takeover.sh`（vfio-pci noiommu）+ `nof_register`；镜像 1103 含 target 但未分发；k8s-2/3 未改；k8s-4/5/6 不存在。NOF-004 取消，下发 NOF-006 只读提取实现规格 |
 | 2026-11-18 | NOF-006 完成：提取 takeover/进程顺序/k8s-2 规格；发现镜像路径 bug（`bin/` vs `build/bin/`）、端口/NQN 写死、`nof_register` 参数缺口；下发 NOF-007 只读前置探查 + node1 规格核对 |
+| 2026-11-18 | 用户确认 node1（构建/镜像源节点）可由测试 Agent 只读访问；地址仅在会话消息中给出，不写公开仓库 |
