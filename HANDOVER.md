@@ -250,8 +250,8 @@
 | NOF-005 | 本地 k8s_deploy 产物只读盘点 | **DONE** | 2026-11-18 |
 | NOF-006 | 从同事文档提取 target takeover / k8s-2 改造规格（只读） | **DONE** | 2026-11-18 |
 | NOF-007 | 前置探查 + node1 规格核对（只读） | **DONE** | 2026-11-18 |
-| NOF-008 | 分发 1156 到缺失节点（写） | **待用户授权** | 2026-11-18 |
-| NOF-009 | 单节点 -Z PoC（写） | **待用户授权** | 2026-11-18 |
+| NOF-008 | 分发 1156 到 worker09（写） | **延后（PoC 不需要；worker02 已有 1156）** | 2026-11-18 |
+| NOF-009 | 单节点 -Z PoC（worker02，写） | **待用户授权（下一步）** | 2026-11-18 |
 
 ---
 
@@ -369,7 +369,10 @@
 
 ## 6. 当前任务
 
-### NOF-008 分发 1156 到 worker09（待用户授权，不要执行）
+### NOF-008 分发 1156 到 worker09（延后，不要执行）
+
+> **延后**：首 PoC 在 worker02，1156 已在该节点，不需要先分发；PoC 成功后再补 worker09。
+> master 根盘 99% 满，**永远不要把镜像导到 master**。
 
 **决策（Dev Agent）**：**只补 worker09，不碰 master**。master 根盘 99% 满（49G 可用），
 导入 6.6G content + 约 6.6G 解包 ≈ 13G，且 imageGC 默认 85% 可能回收；master 是控制面，不冒这个险。
@@ -390,6 +393,8 @@ k8s-4 的 etcd/master/target Pod 一律调度到 worker（7 台 worker 已有镜
 - **用户未明确授权前，不要执行。**
 
 ### NOF-009 单节点 -Z PoC（待用户授权，不要执行）
+
+> **不需要先做 NOF-008**：worker02 已有 1156；本轮只在 worker02 上建临时栈。
 
 - 目标：在 **worker02** 用 1156 起最小栈（临时 namespace `mooncake-nof-poc`：etcd + master + 1 个 target Pod）：
   - etcd/master/target 都用 `nodeSelector kubernetes.io/hostname=worker02`，确保镜像已在；
@@ -671,3 +676,4 @@ tar -xOf "$TAR" "$LAYER" \
 | 2026-11-18 | NOF-006 完成：提取 takeover/进程顺序/k8s-2 规格；发现镜像路径 bug（`bin/` vs `build/bin/`）、端口/NQN 写死、`nof_register` 参数缺口；下发 NOF-007 只读前置探查 + node1 规格核对 |
 | 2026-11-18 | 用户确认 node1（构建/镜像源节点）可由测试 Agent 只读访问；地址仅在会话消息中给出，不写公开仓库 |
 | 2026-11-18 | NOF-007 完成：实际 9 节点；盘/BDF/URMA 实测；node1 端口/NQN 已有 awk 补丁方案；`nof_register` 参数确认（master ip:port、capacity 100GiB）；实际镜像 1156 已分发 7 台、master/worker09 缺失；`preflight_check.sh` 破坏性禁止运行。NOF-008/009 进入待授权 |
+| 2026-11-18 | **NOF-008 延后**：首 PoC 在 worker02（已有 1156），不需要先分发；master 99% 满，永不导镜像。**NOF-009 优先**：worker02 上建临时 namespace + etcd + master + 1 个 `-Z` target，不碰真实盘 |
