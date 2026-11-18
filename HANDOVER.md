@@ -246,7 +246,9 @@
 | NOF-004 | NoF target 路线只读识别 + 新集群基线记录 | **已取消（NOF-005 已回答路线：外部 nvmf_tgt）** | 2026-11-18 |
 | NOF-005 | 本地 k8s_deploy 产物只读盘点 | **DONE** | 2026-11-18 |
 | NOF-006 | 从同事文档提取 target takeover / k8s-2 改造规格（只读） | **DONE** | 2026-11-18 |
-| NOF-007 | 前置探查 + node1 规格核对（只读） | **已下发（本轮）** | 2026-11-18 |
+| NOF-007 | 前置探查 + node1 规格核对（只读） | **DONE** | 2026-11-18 |
+| NOF-008 | 分发 1156 到缺失节点（写） | **待用户授权** | 2026-11-18 |
+| NOF-009 | 单节点 -Z PoC（写） | **待用户授权** | 2026-11-18 |
 
 ---
 
@@ -339,11 +341,53 @@
 - **观察**：`-Z` Null bdev 适合首 PoC；端口/NQN 写死使 recall 2 target/节点不可行；
   hugepages 按池上调；多盘时 `member_count` 取值文档未回答。
 
+### NOF-007 前置探查 + node1 核对（DONE，2026-11-18）
+
+- 节点集：**9 节点**（master, worker02/03/05/06/07/08/09/10）；worker01/04/11 不在。
+- 盘：worker02/06/07/08/09/10 各 7 块空闲 3.5T；worker05 11 块；**worker03 仅 1 块**；
+  master 5 块 3.5T + 2 块 7T。盘符已重排，部署时必须现查。
+- 9/9 节点：vfio/vfio_pci/vfio_iommu_type1 未加载；hugepages=0；无 nvmf_tgt 残留；
+  liburma 全套在；URMA 设备每节点不同（`bonding_dev_*`，11–53 个）。
+- node1：root 免密可达；takeover 脚本 MD5 `c3bc2308…`（36,334 B），常量与本地副本一致
+  （NQN/4420 等写死，无 `-P/-Q`）。
+- **端口/NQN 已有参数化方案**：`/home/yin/Vsegment/vseg_scripts/run_vesegment_target.sh`
+  用 awk 打补丁到 `/tmp` 副本，端口 4420–4499，带端口占用/进程存活护栏；k8s-4 可照搬。
+- **`nof_register` 真实调用**：`nof_register <nqn> 1 <traddr> <trsvcid> URMA <master_ip:port> <capacity>`；
+  capacity 默认 **100 GiB**（107374182400），跨轮次须一致；master 是 `ip:port`，不是 `etcd://`。
+- **master 真实参数**：除 vsegment flags 外，还需 `--enable_ha --enable_oplog --ha_backend_type=etcd
+  --submaster_count=1 --rpc_port 50058 --metrics_port 9008 --default_kv_lease_ttl/soft_pin_ttl`。
+- **镜像实际是 1156**：`202611181156.9b86170a`（6,646,642,688 B，含 `nvmf_tgt` + takeover + rpc.py +
+  python/spdk）；已分发到 worker02/03/05/06/07/08/10（7 台，digest 一致，latest 指向它），
+  **master/worker09 缺失**。1103 不是最终分发版本；0847 不含 target。
+- **`preflight_check.sh` 是破坏性的**（kill master/清 etcd/`rm -rf /var/lib/etcd`/还原盘），**禁止运行**；
+  `probe-nof-prereq.sh` 的 ssh 缺 `-n`，复用需补。
+
 ---
 
 ## 6. 当前任务
 
-### NOF-007 前置探查 + node1 规格核对（本轮执行，只读）
+### NOF-008 分发 1156 到缺失节点（待用户授权，不要执行）
+
+- 目标：master + worker09（如最终节点集含它们）导入 `202611181156.9b86170a` 并打 latest；
+  或统一全部 9 节点。
+- 写操作：`ctr image import`；源 tar 在 controller `/home/yin/downloads/`（已有 1156）。
+- 回退：记录导入前镜像列表；如需回退，删除新增 tag（需单独授权）。
+- **用户未明确授权前，不要执行。**
+
+### NOF-009 单节点 -Z PoC（待用户授权，不要执行）
+
+- 目标：在一个 worker（建议 worker02）用 1156 起最小栈（etcd + master + 1 个 target Pod）：
+  - 建 `build/bin/nvmf_tgt` 符号链；
+  - takeover `-Z -p urma -L /usr/lib64 -N <urma_dev> -i <pod_ip> -m 0x3 -y`；
+  - `nof_register <nqn> 1 <pod_ip> <port> URMA <master_ip:port> 107374182400`；
+  - 验收：master 日志 `MountNoFSegment_slow rc[0]`。
+- **不碰任何真实盘**；hugepages 由 takeover 上调（写 `/proc/sys`），Pod 需 privileged。
+- 回退：删除临时 namespace/Pod；`nr_hugepages` 恢复基线 0；释放 vfio。
+- **用户未明确授权前，不要执行。**
+
+---
+
+### NOF-007 前置探查 + node1 规格核对（DONE，本轮不执行）
 
 **上一轮结论**：NOF-006 提取了 target 规格；关键阻塞是 takeover 版本、端口/NQN 写死、
 `nof_register` 参数、镜像路径不匹配。
@@ -583,13 +627,11 @@ tar -xOf "$TAR" "$LAYER" \
 
 > 不要在 NOF-004 中执行以下任务，等对应任务号下发。
 
-- `NOF-008`：**重新 import/分发镜像 `202611181103.cb1d25e7` 到最终节点集**（写操作，需用户逐项授权；
-  注意 0847 不含 target，不能用于 target Pod）
-- `NOF-009`：**单节点 target-in-pod PoC**：先用 `-Z` Null bdev 验证
-  `nvmf_tgt + nof_register + master MountNoFSegment` 全链路，再换真盘；
-  必须可逆：记录基线、失败回滚；只在一个 worker 上做
-- `NOF-010`：`k8s-4` NoF rank 部署（每节点 1 个 target，bring-up 先 1 块整盘）
-- `NOF-011`：`k8s-4` NoF recall 部署（每节点 2 个 target；需先解决端口/NQN 写死）
+- `NOF-008` / `NOF-009`：见「当前任务」，**待用户授权**。
+- `NOF-010`：`k8s-4` NoF rank 部署（每节点 1 个 target，bring-up 先 1 块整盘；
+  建议排除 master，worker03 只有 1 块盘可跑 rank）
+- `NOF-011`：`k8s-4` NoF recall 部署（每节点 2 个 target；端口/NQN 用
+  `run_vesegment_target.sh` 的 awk 补丁方案；**worker03 只有 1 块空闲盘，需排除**）
 - `NOF-012`：`k8s-5` NoF 加压（复用 k8s-3，切到 NoF namespace）
 - `NOF-013`：`k8s-6` combined（每节点 1 个 target，bring-up 先 1 块盘，rank+recall 共用一个 master）
 
@@ -611,3 +653,4 @@ tar -xOf "$TAR" "$LAYER" \
 | 2026-11-18 | NOF-005 完成：确认 target 路线为外部 `nvmf_tgt` 注入 Pod + `target_nvme_takeover.sh`（vfio-pci noiommu）+ `nof_register`；镜像 1103 含 target 但未分发；k8s-2/3 未改；k8s-4/5/6 不存在。NOF-004 取消，下发 NOF-006 只读提取实现规格 |
 | 2026-11-18 | NOF-006 完成：提取 takeover/进程顺序/k8s-2 规格；发现镜像路径 bug（`bin/` vs `build/bin/`）、端口/NQN 写死、`nof_register` 参数缺口；下发 NOF-007 只读前置探查 + node1 规格核对 |
 | 2026-11-18 | 用户确认 node1（构建/镜像源节点）可由测试 Agent 只读访问；地址仅在会话消息中给出，不写公开仓库 |
+| 2026-11-18 | NOF-007 完成：实际 9 节点；盘/BDF/URMA 实测；node1 端口/NQN 已有 awk 补丁方案；`nof_register` 参数确认（master ip:port、capacity 100GiB）；实际镜像 1156 已分发 7 台、master/worker09 缺失；`preflight_check.sh` 破坏性禁止运行。NOF-008/009 进入待授权 |
