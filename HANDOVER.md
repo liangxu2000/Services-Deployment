@@ -236,6 +236,8 @@
 - **master 磁盘风险（2026-11-18 NOF-008 核对）**：master 根盘 2.9T 已用 99%（49G 可用），
   containerd 数据 12G；`evictionHard` 不监控 nodefs，不会报 DiskPressure；imageGC 默认 85% 可能回收。
   **不要往 master 导镜像/落大文件**；k8s-4 的 etcd/master/target 一律调度到 worker。
+- **worker09 磁盘风险**：根盘 7T 剩 525G（93%），ImageGC 持续报
+  `wanted to free ~960G, freed 0`；**暂不往 worker09 导镜像**（NOF-008 延后）。
 
 ---
 
@@ -251,7 +253,7 @@
 | NOF-006 | 从同事文档提取 target takeover / k8s-2 改造规格（只读） | **DONE** | 2026-11-18 |
 | NOF-007 | 前置探查 + node1 规格核对（只读） | **DONE** | 2026-11-18 |
 | NOF-008 | 分发 1156 到 worker09（写） | **延后（PoC 不需要；worker02 已有 1156）** | 2026-11-18 |
-| NOF-009 | 单节点 -Z PoC（worker02，写） | **待用户授权（下一步）** | 2026-11-18 |
+| NOF-009 | 单节点 -Z PoC（worker10，写） | **待用户授权（下一步）** | 2026-11-18 |
 
 ---
 
@@ -394,15 +396,22 @@ k8s-4 的 etcd/master/target Pod 一律调度到 worker（7 台 worker 已有镜
 
 ### NOF-009 单节点 -Z PoC（待用户授权，不要执行）
 
-> **不需要先做 NOF-008**：worker02 已有 1156；本轮只在 worker02 上建临时栈。
+> **不需要先做 NOF-008**：worker10 已有 1156；本轮只在 worker10 上建临时栈。
+> **worker02 不可用**（2026-11-18 15:14 后主机失联，非本任务导致）；不恢复、不使用。
+> **worker09 / master 不要用**：worker09 无镜像且 ImageGC 僵持（wanted 960G freed 0），master 99% 满。
 
-- 目标：在 **worker02** 用 1156 起最小栈（临时 namespace `mooncake-nof-poc`：etcd + master + 1 个 target Pod）：
-  - etcd/master/target 都用 `nodeSelector kubernetes.io/hostname=worker02`，确保镜像已在；
-  - 建 `build/bin/nvmf_tgt` 符号链；
-  - takeover `-Z -p urma -L /usr/lib64 -N <urma_dev> -i <pod_ip> -m 0x3 -y`；
+- 节点：**worker10**（镜像 1156 已在、根盘剩 2.8T、内存 2.2T、udmac 设备齐、hugepages=0、vfio 未加载）。
+- 目标：临时 namespace `mooncake-nof-poc`：etcd + master + 1 个 target Pod，全部
+  `nodeSelector kubernetes.io/hostname=worker10`：
+  - 建 `build/bin/nvmf_tgt` 符号链：
+    `mkdir -p /home/mooncake/spdk/build/bin && ln -sf ../bin/nvmf_tgt /home/mooncake/spdk/build/bin/nvmf_tgt`；
+  - takeover `-Z -p urma -L /usr/lib64 -N <udmac_dev> -i <pod_ip> -m 0x3 -y`
+    （**必须显式覆盖**；镜像缺 `ip` 所以 `-i` 必须手传；缺 `ss`，端口检查用 python3 或跳过）；
   - `nof_register <nqn> 1 <pod_ip> <port> URMA <master_ip:port> 107374182400`；
   - 验收：master 日志 `MountNoFSegment_slow rc[0]`。
-- **不碰任何真实盘**；hugepages 由 takeover 上调（写 `/proc/sys`），Pod 需 privileged。
+- **不碰任何真实盘**（`-Z` Null bdev）；`lspci`/`modprobe` 缺失不影响 `-Z`。
+- **授权写 hugepages**：takeover 会把 worker10 的 `/proc/sys/vm/nr_hugepages` 从 0 上调到约 2304 页
+  （~4.5GiB）；这是本任务唯一授权的宿主机全局写操作；回退恢复 0。
 - 如果 Pod IP 作为 `-i` 失败：改用 `hostNetwork: true` + 节点 fabric IP（`dnsPolicy: ClusterFirstWithHostNet`）。
 - 回退：删除临时 namespace/Pod；`nr_hugepages` 恢复基线 0；释放 vfio。
 - **用户未明确授权前，不要执行。**
@@ -677,3 +686,4 @@ tar -xOf "$TAR" "$LAYER" \
 | 2026-11-18 | 用户确认 node1（构建/镜像源节点）可由测试 Agent 只读访问；地址仅在会话消息中给出，不写公开仓库 |
 | 2026-11-18 | NOF-007 完成：实际 9 节点；盘/BDF/URMA 实测；node1 端口/NQN 已有 awk 补丁方案；`nof_register` 参数确认（master ip:port、capacity 100GiB）；实际镜像 1156 已分发 7 台、master/worker09 缺失；`preflight_check.sh` 破坏性禁止运行。NOF-008/009 进入待授权 |
 | 2026-11-18 | **NOF-008 延后**：首 PoC 在 worker02（已有 1156），不需要先分发；master 99% 满，永不导镜像。**NOF-009 优先**：worker02 上建临时 namespace + etcd + master + 1 个 `-Z` target，不碰真实盘 |
+| 2026-11-18 | **worker02 主机失联**（15:14 后，非本任务导致），PoC 改到 **worker10**；授权写一次 worker10 的 `nr_hugepages`（~4.5GiB，回退 0）；NOF-009 仍待用户授权。worker09 ImageGC 僵持，NOF-008 继续延后 |
