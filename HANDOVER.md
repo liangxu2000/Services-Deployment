@@ -121,6 +121,21 @@
   - **initiator**：连接 target 读写的一方；本项目的 `mooncake_client` 是 initiator。
   - 「一个 NoF target = 一个 Pod」是待验证的部署假设，不是既定事实。
 
+**3.1 已确认的设计决策（2026-11-17，用户确认）**
+
+1. **节点数**：当前实测 10；组 k8s 时会移除只有 2 块盘的节点。**不要硬编码节点数**，
+   部署时用 `kubectl get nodes` / DaemonSet 动态发现。
+2. **感知范围**：管理端与测试 Agent **只连 controller/master**；集群内部由 Kubernetes 管理。
+   只有镜像分发（k8s-1）按现有脚本需要 controller → worker 的 SSH；NOF-001 已确认可用。
+   后续不再逐节点摸硬件；节点级检查只在明确任务里做。
+3. **实现范围**：`k8s-4` rank、`k8s-4` recall、`k8s-5` pressure、`k8s-6` combined
+   **全部要实现**；顺序：**k8s-4 rank/recall → k8s-5 → k8s-6**。
+4. **k8s-6**：rank 和 recall **共用一个 master**。
+5. **分盘**：以**整盘为最小单位**，不做 VF、不做每盘 1/3。
+   - k8s-4：每节点 3 个 target（rank 1 + recall 2），整盘按 **2/2/3**
+     （或按实际数据盘数尽量均分）；
+   - k8s-6：每节点 1 个 target，独占全部数据盘。
+
 ---
 
 ## 4. 任务索引
@@ -312,11 +327,18 @@ kubectl -n mooncake-memory-pressure get ds -o wide 2>/dev/null || true
 
 > 不要在 NOF-003 中执行以下任务，等对应任务号下发。
 
-- `NOF-004`：编译 NoF 版本（基于 `mooncake-vesegment`，`USE_NOF/USE_NOF_URMA`）——执行位置与方式由 Dev Agent 决定
-- `NOF-005`：构建 runtime 镜像并校验 `nof_register` / SPDK 依赖
-- `NOF-006`：镜像分发到实际节点
-- `NOF-007`：部署 NoF rank / recall，验证向 master 注册
-- `NOF-008`：背压与基线性能测试
+> 设计决策不改变本轮只读范围；NOF-003 仍按只读执行。若用户决定跳过，
+> 则按「当前镜像不含 NoF」处理，直接进入 NOF-004 编译。
+
+- `NOF-004`：编译 NoF 版本（基于 `mooncake-vesegment`，`USE_NOF` / `USE_NOF_URMA`，
+  构建 `nof_register` / `nof_unregister`）——执行位置与方式由 Dev Agent 决定
+- `NOF-005`：构建 runtime 镜像，校验 SPDK / NoF 二进制 / ldd
+- `NOF-006`：**单节点 target-in-pod PoC**（需要写授权：hugepages + 整盘设备直通/绑定；
+  必须可逆：记录基线、失败回滚；只在一个 worker 上做）
+- `NOF-007`：`k8s-4` NoF rank 部署（每节点 1 个 target，整盘分配）
+- `NOF-008`：`k8s-4` NoF recall 部署（每节点 2 个 target，整盘分配）
+- `NOF-009`：`k8s-5` NoF 加压（复用 k8s-3，切到 NoF namespace）
+- `NOF-010`：`k8s-6` combined（每节点 1 个 target，rank+recall 共用一个 master）
 
 ---
 
@@ -328,3 +350,4 @@ kubectl -n mooncake-memory-pressure get ds -o wide 2>/dev/null || true
 | 2026-11-17 | **置顶最高优先级安全令：默认且优先只读，任何变更须逐项书面授权**；明确 Dev Agent / Test Agent 分工 |
 | 2026-11-17 | NOF-001 完成（实测 10 节点）；下发 NOF-002 只读深挖；强化角色边界 |
 | 2026-11-17 | NOF-002 完成（CrashLoop 瞬态自愈；镜像元数据无 NoF；SR-IOV `vwci=0`；环境新增 recall+pressure）；下发 NOF-003 镜像文件级只读查验；数据盘不均视为临时状态，不作为方案约束 |
+| 2026-11-17 | 用户确认设计决策：10 节点按 10 推进、组 k8s 时移除 2 盘节点；管理端只感知 master；k8s-4/5/6 全部实现（先 k8s-4）；k8s-6 共用一个 master；分盘以整盘为最小单位，不做 VF/1/3 |
